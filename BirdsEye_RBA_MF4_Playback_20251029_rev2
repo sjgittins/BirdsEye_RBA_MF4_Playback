@@ -101,14 +101,20 @@ def process_rba_event(mdf, event_time, event_num):
             playback_data[signal_name] = np.full(len(common_time), np.nan)
             continue
         
-        # Use 'previous' (step) interpolation for discrete state signals
+        # --- ROBUST FIX ---
+        # Replaced the problematic asammdf.interp() method with a manual numpy implementation
+        # that is independent of the library version.
         if signal_name in ['GearLvrPos_D_Actl', RBA_FLAG_SIGNAL] or 'PrkAidSns' in signal_name:
-            # --- FIX ---
-            # Corrected keyword from 'interpolation_mode' to 'kind' for asammdf library
-            interp_samples = sig.interp(common_time, kind='previous').samples
+            # This is a manual implementation of "previous" or "step" interpolation.
+            # It finds the index of the last known value for each timestamp in common_time.
+            indices = np.searchsorted(sig.timestamps, common_time, side='right') - 1
+            # Ensure indices are not out of bounds (e.g., -1 for early timestamps)
+            indices = np.clip(indices, 0, len(sig.samples) - 1)
+            interp_samples = sig.samples[indices]
         else:
-            # Use linear interpolation for continuous signals
+            # Use standard linear interpolation for continuous signals
             interp_samples = np.interp(common_time, sig.timestamps, sig.samples)
+        
         playback_data[signal_name] = interp_samples
 
     df = pd.DataFrame(playback_data)
