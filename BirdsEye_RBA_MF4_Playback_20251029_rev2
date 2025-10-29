@@ -46,7 +46,7 @@ def get_first_signal(mdf, name):
 def find_rba_events(rba_signal):
     """
     Finds RBA event triggers, automatically handling both numeric (0/1) and
-    string ('Enable'/'Disable') signal types to be more robust.
+    string ('Enable'/'Disable') signal types.
     """
     if rba_signal is None:
         logging.error("RBA signal object is None, cannot find events.")
@@ -54,27 +54,23 @@ def find_rba_events(rba_signal):
 
     samples = rba_signal.samples
     
-    # Check if the signal data is numeric (e.g., int, float)
     if np.issubdtype(samples.dtype, np.number):
         logging.info("RBA signal is NUMERIC. Looking for transition to '1'.")
         is_enabled = (samples == 1)
     else:
-        # If not numeric, assume it's string-based
         logging.info("RBA signal is STRING. Looking for transition to 'Enable'.")
         try:
             cleaned_samples = np.char.strip(np.char.decode(samples, 'utf-8', 'ignore'))
         except (TypeError, AttributeError):
             cleaned_samples = np.array([str(s).strip() for s in samples])
-        
         is_enabled = (cleaned_samples == 'Enable')
 
-    # The core logic is now the same for both data types
     if not np.any(is_enabled):
         logging.warning("No 'active' state (either 1 or 'Enable') found in the RBA signal.")
         return np.array([])
         
     was_disabled = np.roll(is_enabled, 1)
-    was_disabled[0] = False # Ensure the first sample can be a trigger
+    was_disabled[0] = False
     
     event_indices = np.where(is_enabled & ~was_disabled)[0]
     event_times = rba_signal.timestamps[event_indices]
@@ -107,7 +103,9 @@ def process_rba_event(mdf, event_time, event_num):
         
         # Use 'previous' (step) interpolation for discrete state signals
         if signal_name in ['GearLvrPos_D_Actl', RBA_FLAG_SIGNAL] or 'PrkAidSns' in signal_name:
-            interp_samples = sig.interp(common_time, interpolation_mode='previous').samples
+            # --- FIX ---
+            # Corrected keyword from 'interpolation_mode' to 'kind' for asammdf library
+            interp_samples = sig.interp(common_time, kind='previous').samples
         else:
             # Use linear interpolation for continuous signals
             interp_samples = np.interp(common_time, sig.timestamps, sig.samples)
@@ -119,7 +117,7 @@ def process_rba_event(mdf, event_time, event_num):
     df['speed_mps'] = df['Veh_V_ActlBrk'] / 3.6
     df['steering_rad'] = np.deg2rad(df['StePinComp_An_Est'])
 
-    x_pos, y_pos, heading = [0.0], [0.0], [np.pi / 2] # Start at (0,0) facing "up"
+    x_pos, y_pos, heading = [0.0], [0.0], [np.pi / 2]
 
     for i in range(1, len(df)):
         dt = TIME_STEP
@@ -128,8 +126,8 @@ def process_rba_event(mdf, event_time, event_num):
         gear = df['GearLvrPos_D_Actl'].iloc[i-1]
         
         direction = 0
-        if gear == 1: direction = -1 # Reverse
-        elif gear == 3: direction = 1 # Drive
+        if gear == 1: direction = -1
+        elif gear == 3: direction = 1
 
         d_heading = (speed / VEHICLE_WHEELBASE) * np.tan(steer_angle) * dt
         current_heading = heading[-1]
