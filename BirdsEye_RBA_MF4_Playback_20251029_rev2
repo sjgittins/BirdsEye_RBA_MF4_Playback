@@ -5,113 +5,98 @@ from asammdf import MDF
 import logging
 
 # --- Configuration ---
-# Set up basic logging to see the script's progress.
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-# Define all the signals we need for the playback.
-# We can easily add more here later.
+# Signal names
 RBA_FLAG_SIGNAL = 'BrkDecel_B_RqRba'
 CORE_SIGNALS = [
-    'Veh_V_ActlBrk',        # Vehicle Speed (from Brake system)
-    'StePinComp_An_Est',    # Steering Angle (in degrees) - CORRECTED NAME
-    'GearLvrPos_D_Actl',    # Gear Position (0=P, 1=R, 2=N, 3=D)
+    'Veh_V_ActlBrk',        
+    'StePinComp_An_Est',    
+    'GearLvrPos_D_Actl',    
 ]
 PARK_AID_SENSORS = [
-    'PrkAidSnsFlCrnr_D_Stat', # Front Left Corner
-    'PrkAidSnsFlCntr_D_Stat', # Front Left Center
-    'PrkAidSnsFrCntr_D_Stat', # Front Right Center
-    'PrkAidSnsFrCrnr_D_Stat', # Front Right Corner
-    'PrkAidSnsRlCrnr_D_Stat', # Rear Left Corner
-    'PrkAidSnsRlCntr_D_Stat', # Rear Left Center
-    'PrkAidSnsRrCntr_D_Stat', # Rear Right Center
-    'PrkAidSnsRrCrnr_D_Stat', # Rear Right Corner
+    'PrkAidSnsFlCrnr_D_Stat', 'PrkAidSnsFlCntr_D_Stat',
+    'PrkAidSnsFrCntr_D_Stat', 'PrkAidSnsFrCrnr_D_Stat',
+    'PrkAidSnsRlCrnr_D_Stat', 'PrkAidSnsRlCntr_D_Stat',
+    'PrkAidSnsRrCntr_D_Stat', 'PrkAidSnsRrCrnr_D_Stat',
 ]
 ALL_REQUIRED_SIGNALS = [RBA_FLAG_SIGNAL] + CORE_SIGNALS + PARK_AID_SENSORS
 
-# --- Vehicle & Simulation Parameters ---
-TIME_WINDOW_BEFORE = 5.0  # Seconds before the event to capture
-TIME_WINDOW_AFTER = 5.0   # Seconds after the event to capture
-TIME_STEP = 0.02          # Time resolution for the output data (50 Hz)
-VEHICLE_WHEELBASE = 2.95  # Wheelbase in meters. (Assumption, adjust for your vehicle)
-
+# Parameters
+TIME_WINDOW_BEFORE = 5.0
+TIME_WINDOW_AFTER = 5.0
+TIME_STEP = 0.02
+VEHICLE_WHEELBASE = 2.95 # meters
 
 def get_first_signal(mdf, name):
-    """
-    Safely retrieves the first valid signal occurrence from an MDF file.
-    This function is restored from your original code to handle cases 
-    where the same signal name appears in multiple data groups, which was
-    the cause of the "Multiple occurrences" error.
-    """
+    """Safely retrieves the first valid signal occurrence from an MDF file."""
     if not name or name not in mdf.channels_db:
         logging.warning(f"Could not find signal '{name}' in the file's channel database.")
         return None
-    
-    # Iterate through all found occurrences (group, index)
     for grp, idx in mdf.channels_db[name]:
         try:
-            # Attempt to load the signal from the specific group and index
             sig = mdf.get(name, group=grp, index=idx)
-            # If the signal loaded and has data, return it
             if sig is not None and len(sig.samples) > 0:
-                logging.debug(f"Successfully loaded signal '{name}' from group {grp}, index {idx}.")
                 return sig
         except Exception as e:
-            # Log if a specific occurrence fails to load, but continue trying others
             logging.error(f"Error loading an instance of signal {name} from group {grp}: {e}")
-            
     logging.warning(f"Found occurrences for '{name}', but none could be loaded successfully or had data.")
     return None
 
 def find_rba_events(rba_signal):
-    """Finds the timestamps where the RBA flag becomes 'Enable'."""
+    """
+    Finds RBA event triggers, automatically handling both numeric (0/1) and
+    string ('Enable'/'Disable') signal types to be more robust.
+    """
     if rba_signal is None:
-        return []
-    
-    # Clean the signal samples (often stored as bytes)
-    try:
-        # Vectorized approach for speed
-        cleaned_samples = np.char.strip(np.char.decode(rba_signal.samples, 'utf-8', 'ignore'))
-    except (TypeError, AttributeError):
-        # Fallback for already-string types
-        cleaned_samples = np.array([str(s).strip() for s in rba_signal.samples])
+        logging.error("RBA signal object is None, cannot find events.")
+        return np.array([])
 
-    # Find where the signal switches from not 'Enable' to 'Enable'
-    is_enabled = (cleaned_samples == 'Enable')
+    samples = rba_signal.samples
+    
+    # Check if the signal data is numeric (e.g., int, float)
+    if np.issubdtype(samples.dtype, np.number):
+        logging.info("RBA signal is NUMERIC. Looking for transition to '1'.")
+        is_enabled = (samples == 1)
+    else:
+        # If not numeric, assume it's string-based
+        logging.info("RBA signal is STRING. Looking for transition to 'Enable'.")
+        try:
+            cleaned_samples = np.char.strip(np.char.decode(samples, 'utf-8', 'ignore'))
+        except (TypeError, AttributeError):
+            cleaned_samples = np.array([str(s).strip() for s in samples])
+        
+        is_enabled = (cleaned_samples == 'Enable')
+
+    # The core logic is now the same for both data types
+    if not np.any(is_enabled):
+        logging.warning("No 'active' state (either 1 or 'Enable') found in the RBA signal.")
+        return np.array([])
+        
     was_disabled = np.roll(is_enabled, 1)
-    was_disabled[0] = False # Ensure the very first sample can be an event
+    was_disabled[0] = False # Ensure the first sample can be a trigger
     
     event_indices = np.where(is_enabled & ~was_disabled)[0]
-    
     event_times = rba_signal.timestamps[event_indices]
-    logging.info(f"Found {len(event_times)} RBA event(s) at times: {[f'{t:.2f}s' for t in event_times]}")
+    
     return event_times
 
 def convert_sensor_value_to_distance(sensor_value):
-    """
-    Converts the raw park aid sensor value to a distance in meters.
-    15 = Clear, 1 = 0-15cm, 2 = 15-30cm, etc.
-    We return the midpoint of the zone for a single distance value.
-    """
+    """Converts the raw park aid sensor value to a distance in meters."""
     if pd.isna(sensor_value) or sensor_value >= 15 or sensor_value < 1:
-        return np.nan # No object detected
-
-    # The value represents the zone number. Zone '1' is the closest.
-    min_dist = (sensor_value - 1) * 0.15
+        return np.nan
+    min_dist = (float(sensor_value) - 1) * 0.15
     mid_dist = min_dist + 0.075
     return mid_dist
 
 def process_rba_event(mdf, event_time, event_num):
-    """
-    Processes a single RBA event to generate playback data.
-    """
+    """Processes a single RBA event to generate playback data."""
     logging.info(f"--- Processing Event #{event_num} at {event_time:.2f}s ---")
 
-    # 1. Define the time window and create a common time vector
     start_time = event_time - TIME_WINDOW_BEFORE
     end_time = event_time + TIME_WINDOW_AFTER
     common_time = np.arange(start_time, end_time, TIME_STEP)
     
-    # 2. Interpolate all required signals onto the common time vector
     playback_data = {'time': common_time}
     for signal_name in ALL_REQUIRED_SIGNALS:
         sig = get_first_signal(mdf, signal_name)
@@ -120,28 +105,24 @@ def process_rba_event(mdf, event_time, event_num):
             playback_data[signal_name] = np.full(len(common_time), np.nan)
             continue
         
-        # Use 'previous' interpolation for state signals to avoid looking into the future
+        # Use 'previous' (step) interpolation for discrete state signals
         if signal_name in ['GearLvrPos_D_Actl', RBA_FLAG_SIGNAL] or 'PrkAidSns' in signal_name:
-            # The interp method from asammdf is efficient for this
             interp_samples = sig.interp(common_time, interpolation_mode='previous').samples
         else:
-            # Standard numpy interpolation for continuous signals
+            # Use linear interpolation for continuous signals
             interp_samples = np.interp(common_time, sig.timestamps, sig.samples)
-            
         playback_data[signal_name] = interp_samples
 
     df = pd.DataFrame(playback_data)
 
-    # 3. Calculate Vehicle Path (Dead Reckoning)
     logging.info("Calculating vehicle path using dead reckoning...")
-    
-    df['speed_mps'] = df['Veh_V_ActlBrk'] / 3.6 # kph to m/s
-    df['steering_rad'] = np.deg2rad(df['StePinComp_An_Est']) # degrees to radians
+    df['speed_mps'] = df['Veh_V_ActlBrk'] / 3.6
+    df['steering_rad'] = np.deg2rad(df['StePinComp_An_Est'])
 
     x_pos, y_pos, heading = [0.0], [0.0], [np.pi / 2] # Start at (0,0) facing "up"
 
     for i in range(1, len(df)):
-        dt = TIME_STEP # Use the fixed time step for consistency
+        dt = TIME_STEP
         speed = df['speed_mps'].iloc[i-1]
         steer_angle = df['steering_rad'].iloc[i-1]
         gear = df['GearLvrPos_D_Actl'].iloc[i-1]
@@ -163,10 +144,55 @@ def process_rba_event(mdf, event_time, event_num):
     df['y_pos'] = y_pos
     df['heading_rad'] = heading
     
-    # 4. Process Sensor Data
     logging.info("Converting sensor values to distances...")
     for sensor_name in PARK_AID_SENSORS:
         dist_col_name = f"{sensor_name.replace('_D_Stat', '')}_dist_m"
         df[dist_col_name] = df[sensor_name].apply(convert_sensor_value_to_distance)
 
-    # 5. Clean up and save
+    output_columns = [
+        'time', 'x_pos', 'y_pos', 'heading_rad', 'speed_mps', 'steering_rad', 'GearLvrPos_D_Actl'
+    ] + [col for col in df.columns if '_dist_m' in col]
+    
+    final_df = df[output_columns].copy()
+    final_df['time_relative_s'] = final_df['time'] - event_time
+    final_df = final_df[['time_relative_s'] + output_columns]
+
+    return final_df
+
+def main(mdf_filepath):
+    """Main function to process a single MF4 file and generate playback CSVs."""
+    if not os.path.exists(mdf_filepath):
+        logging.error(f"File not found: {mdf_filepath}")
+        return
+
+    logging.info(f"Processing file: {mdf_filepath}")
+    base_filename = os.path.splitext(os.path.basename(mdf_filepath))[0]
+    
+    try:
+        mdf = MDF(mdf_filepath)
+        rba_signal = get_first_signal(mdf, RBA_FLAG_SIGNAL)
+        if rba_signal is None:
+            logging.error(f"Cannot proceed. The trigger signal '{RBA_FLAG_SIGNAL}' could not be loaded.")
+            return
+
+        event_times = find_rba_events(rba_signal)
+        
+        if event_times.size == 0:
+            logging.info("No RBA events found in this file.")
+            return
+            
+        logging.info(f"Found {len(event_times)} RBA event(s) at times: {[f'{t:.2f}s' for t in event_times]}")
+        for i, event_time in enumerate(event_times, 1):
+            playback_df = process_rba_event(mdf, event_time, i)
+            output_filename = f"playback_data_{base_filename}_event_{i}.csv"
+            playback_df.to_csv(output_filename, index=False, float_format='%.4f')
+            logging.info(f"Successfully saved playback data to '{output_filename}'")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
+    finally:
+        if 'mdf' in locals():
+            mdf.close()
+
+if __name__ == '__main__':
+    mf4_file_to_process = '/media/pi/Extreme SSD/BirdsEye_RBA_MF4_Playback/20251028_RBA_Issue.mf4'
+    main(mf4_file_to_process)
