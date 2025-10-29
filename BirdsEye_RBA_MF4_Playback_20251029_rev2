@@ -1,0 +1,172 @@
+import os
+import numpy as np
+import pandas as pd
+from asammdf import MDF
+import logging
+
+# --- Configuration ---
+# Set up basic logging to see the script's progress.
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Define all the signals we need for the playback.
+# We can easily add more here later.
+RBA_FLAG_SIGNAL = 'BrkDecel_B_RqRba'
+CORE_SIGNALS = [
+    'Veh_V_ActlBrk',        # Vehicle Speed (from Brake system)
+    'StePinComp_An_Est',    # Steering Angle (in degrees) - CORRECTED NAME
+    'GearLvrPos_D_Actl',    # Gear Position (0=P, 1=R, 2=N, 3=D)
+]
+PARK_AID_SENSORS = [
+    'PrkAidSnsFlCrnr_D_Stat', # Front Left Corner
+    'PrkAidSnsFlCntr_D_Stat', # Front Left Center
+    'PrkAidSnsFrCntr_D_Stat', # Front Right Center
+    'PrkAidSnsFrCrnr_D_Stat', # Front Right Corner
+    'PrkAidSnsRlCrnr_D_Stat', # Rear Left Corner
+    'PrkAidSnsRlCntr_D_Stat', # Rear Left Center
+    'PrkAidSnsRrCntr_D_Stat', # Rear Right Center
+    'PrkAidSnsRrCrnr_D_Stat', # Rear Right Corner
+]
+ALL_REQUIRED_SIGNALS = [RBA_FLAG_SIGNAL] + CORE_SIGNALS + PARK_AID_SENSORS
+
+# --- Vehicle & Simulation Parameters ---
+TIME_WINDOW_BEFORE = 5.0  # Seconds before the event to capture
+TIME_WINDOW_AFTER = 5.0   # Seconds after the event to capture
+TIME_STEP = 0.02          # Time resolution for the output data (50 Hz)
+VEHICLE_WHEELBASE = 2.95  # Wheelbase in meters. (Assumption, adjust for your vehicle)
+
+
+def get_first_signal(mdf, name):
+    """
+    Safely retrieves the first valid signal occurrence from an MDF file.
+    This function is restored from your original code to handle cases 
+    where the same signal name appears in multiple data groups, which was
+    the cause of the "Multiple occurrences" error.
+    """
+    if not name or name not in mdf.channels_db:
+        logging.warning(f"Could not find signal '{name}' in the file's channel database.")
+        return None
+    
+    # Iterate through all found occurrences (group, index)
+    for grp, idx in mdf.channels_db[name]:
+        try:
+            # Attempt to load the signal from the specific group and index
+            sig = mdf.get(name, group=grp, index=idx)
+            # If the signal loaded and has data, return it
+            if sig is not None and len(sig.samples) > 0:
+                logging.debug(f"Successfully loaded signal '{name}' from group {grp}, index {idx}.")
+                return sig
+        except Exception as e:
+            # Log if a specific occurrence fails to load, but continue trying others
+            logging.error(f"Error loading an instance of signal {name} from group {grp}: {e}")
+            
+    logging.warning(f"Found occurrences for '{name}', but none could be loaded successfully or had data.")
+    return None
+
+def find_rba_events(rba_signal):
+    """Finds the timestamps where the RBA flag becomes 'Enable'."""
+    if rba_signal is None:
+        return []
+    
+    # Clean the signal samples (often stored as bytes)
+    try:
+        # Vectorized approach for speed
+        cleaned_samples = np.char.strip(np.char.decode(rba_signal.samples, 'utf-8', 'ignore'))
+    except (TypeError, AttributeError):
+        # Fallback for already-string types
+        cleaned_samples = np.array([str(s).strip() for s in rba_signal.samples])
+
+    # Find where the signal switches from not 'Enable' to 'Enable'
+    is_enabled = (cleaned_samples == 'Enable')
+    was_disabled = np.roll(is_enabled, 1)
+    was_disabled[0] = False # Ensure the very first sample can be an event
+    
+    event_indices = np.where(is_enabled & ~was_disabled)[0]
+    
+    event_times = rba_signal.timestamps[event_indices]
+    logging.info(f"Found {len(event_times)} RBA event(s) at times: {[f'{t:.2f}s' for t in event_times]}")
+    return event_times
+
+def convert_sensor_value_to_distance(sensor_value):
+    """
+    Converts the raw park aid sensor value to a distance in meters.
+    15 = Clear, 1 = 0-15cm, 2 = 15-30cm, etc.
+    We return the midpoint of the zone for a single distance value.
+    """
+    if pd.isna(sensor_value) or sensor_value >= 15 or sensor_value < 1:
+        return np.nan # No object detected
+
+    # The value represents the zone number. Zone '1' is the closest.
+    min_dist = (sensor_value - 1) * 0.15
+    mid_dist = min_dist + 0.075
+    return mid_dist
+
+def process_rba_event(mdf, event_time, event_num):
+    """
+    Processes a single RBA event to generate playback data.
+    """
+    logging.info(f"--- Processing Event #{event_num} at {event_time:.2f}s ---")
+
+    # 1. Define the time window and create a common time vector
+    start_time = event_time - TIME_WINDOW_BEFORE
+    end_time = event_time + TIME_WINDOW_AFTER
+    common_time = np.arange(start_time, end_time, TIME_STEP)
+    
+    # 2. Interpolate all required signals onto the common time vector
+    playback_data = {'time': common_time}
+    for signal_name in ALL_REQUIRED_SIGNALS:
+        sig = get_first_signal(mdf, signal_name)
+        if sig is None or len(sig.samples) < 2:
+            logging.warning(f"Signal '{signal_name}' is missing or empty. Filling with NaNs.")
+            playback_data[signal_name] = np.full(len(common_time), np.nan)
+            continue
+        
+        # Use 'previous' interpolation for state signals to avoid looking into the future
+        if signal_name in ['GearLvrPos_D_Actl', RBA_FLAG_SIGNAL] or 'PrkAidSns' in signal_name:
+            # The interp method from asammdf is efficient for this
+            interp_samples = sig.interp(common_time, interpolation_mode='previous').samples
+        else:
+            # Standard numpy interpolation for continuous signals
+            interp_samples = np.interp(common_time, sig.timestamps, sig.samples)
+            
+        playback_data[signal_name] = interp_samples
+
+    df = pd.DataFrame(playback_data)
+
+    # 3. Calculate Vehicle Path (Dead Reckoning)
+    logging.info("Calculating vehicle path using dead reckoning...")
+    
+    df['speed_mps'] = df['Veh_V_ActlBrk'] / 3.6 # kph to m/s
+    df['steering_rad'] = np.deg2rad(df['StePinComp_An_Est']) # degrees to radians
+
+    x_pos, y_pos, heading = [0.0], [0.0], [np.pi / 2] # Start at (0,0) facing "up"
+
+    for i in range(1, len(df)):
+        dt = TIME_STEP # Use the fixed time step for consistency
+        speed = df['speed_mps'].iloc[i-1]
+        steer_angle = df['steering_rad'].iloc[i-1]
+        gear = df['GearLvrPos_D_Actl'].iloc[i-1]
+        
+        direction = 0
+        if gear == 1: direction = -1 # Reverse
+        elif gear == 3: direction = 1 # Drive
+
+        d_heading = (speed / VEHICLE_WHEELBASE) * np.tan(steer_angle) * dt
+        current_heading = heading[-1]
+        dx = direction * speed * np.cos(current_heading) * dt
+        dy = direction * speed * np.sin(current_heading) * dt
+        
+        heading.append(current_heading + d_heading)
+        x_pos.append(x_pos[-1] + dx)
+        y_pos.append(y_pos[-1] + dy)
+        
+    df['x_pos'] = x_pos
+    df['y_pos'] = y_pos
+    df['heading_rad'] = heading
+    
+    # 4. Process Sensor Data
+    logging.info("Converting sensor values to distances...")
+    for sensor_name in PARK_AID_SENSORS:
+        dist_col_name = f"{sensor_name.replace('_D_Stat', '')}_dist_m"
+        df[dist_col_name] = df[sensor_name].apply(convert_sensor_value_to_distance)
+
+    # 5. Clean up and save
